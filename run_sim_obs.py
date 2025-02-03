@@ -5,103 +5,236 @@ import os
 
 import numpy as np
 from scipy.spatial import cKDTree
+import numpy as np
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+from numba import njit
+import math
 
-def line_circle_intersect(x_old, x_new, cx, cy, R):
-    """
-    Znajduje przecięcie odcinka x_old -> x_new z okręgiem (cx, cy, R).
-    x_old: (2,) stara pozycja
-    x_new: (2,) nowa pozycja
-    Zwraca (t, point), gdzie t w [0,1], point = (px, py) jest punktem przecięcia
-    jeśli istnieje. Jeśli brak przecięcia lub leży poza odcinkiem [0,1], 
-    zwraca (None, None).
-    
-    Rozwiązujemy || x_old + t*(x_new - x_old) - c || = R
-    tj. || (dx, dy)*t + (x_old - c) || = R.
-    """
-    ox, oy = x_old
-    nx, ny = x_new
+@njit
+def line_circle_intersect_numba(x_old, x_new, cx, cy, R):
+    ox = x_old[0]
+    oy = x_old[1]
+    nx = x_new[0]
+    ny = x_new[1]
     dx = nx - ox
     dy = ny - oy
-    
-    # Wektor do środka okręgu
     fx = ox - cx
     fy = oy - cy
-    
-    # Parametry równania kwadratowego
-    # (dx^2 + dy^2)*t^2 + 2(dx fx + dy fy)*t + (fx^2 + fy^2 - R^2) = 0
     A = dx*dx + dy*dy
     B = 2*(dx*fx + dy*fy)
     C = fx*fx + fy*fy - R*R
-    
-    # Jeśli A=0 (x_old==x_new?), raczej brak ruchu
+
     if abs(A) < 1e-14:
-        return None, None
+        return -1.0, np.array([0.0, 0.0])
     
     disc = B*B - 4*A*C
     if disc < 0:
-        # brak rzeczywistego przecięcia
-        return None, None
+        return -1.0, np.array([0.0, 0.0])
     
-    # Mamy 2 rozwiązania t1, t2:
-    sqrt_disc = np.sqrt(disc)
+    sqrt_disc = math.sqrt(disc)
     t1 = (-B - sqrt_disc) / (2*A)
     t2 = (-B + sqrt_disc) / (2*A)
     
-    # Szukamy "najmniejszego dodatniego" t, bo to pierwsze przecięcie z odcinkiem
-    sol = []
-    for tt in [t1, t2]:
-        if 0 <= tt <= 1:
-            sol.append(tt)
+    t_hit = 2.0
+    if 0.0 <= t1 <= 1.0:
+        t_hit = t1
+    if 0.0 <= t2 <= 1.0 and t2 < t_hit:
+        t_hit = t2
+    if t_hit > 1.0:
+        return -1.0, np.array([0.0, 0.0])
     
-    if len(sol)==0:
-        return None, None
-    
-    t_hit = min(sol)
-    px = ox + t_hit*dx
-    py = oy + t_hit*dy
-    return t_hit, (px, py)
+    p_hit = np.array([ox + t_hit*dx, oy + t_hit*dy])
+    return t_hit, p_hit
 
-def reflect_direction(old_dir, normal_vec):
+@njit
+def reflect_direction_numba(old_dir, nx, ny):
     """
-    Odbicie wektora z kąta old_dir (radian) względem normal_vec (2,).
-    normal_vec nie musi być znormalizowany, ważny jest kierunek.
-    Zwraca new_dir (radian).
-    
-    Algorytm:
-      v = (cos old_dir, sin old_dir)
-      n = normal_vec (unorm)
-      1) un = n / ||n||
-      2) v' = v - 2(v dot un)*un
-      3) new_dir = atan2(v'_y, v'_x)
+    Odbicie wektora o kącie old_dir względem wektora normalnego (nx, ny).
     """
-    vx = np.cos(old_dir)
-    vy = np.sin(old_dir)
-    nx, ny = normal_vec
-    
-    norm_n = np.sqrt(nx*nx + ny*ny)
+    vx = math.cos(old_dir)
+    vy = math.sin(old_dir)
+    norm_n = math.sqrt(nx*nx + ny*ny)
     if norm_n < 1e-14:
-        return old_dir  # normal degenerate => no reflection
-    
+        return old_dir
     unx = nx / norm_n
     uny = ny / norm_n
-    
     dot = vx*unx + vy*uny
-    rx = vx - 2*dot*unx
-    ry = vy - 2*dot*uny
-    
-    return np.arctan2(ry, rx)
+    rx = vx - 2 * dot * unx
+    ry = vy - 2 * dot * uny
+    return math.atan2(ry, rx)
 
-def inside_any_obstacle(pos, obstacles):
+@njit
+def process_collisions(positions, old_positions, new_dirs, obstacles, eps, L):
     """
-    Czy pos=(x,y) leży w środku którejś z przeszkód?
+    Przetwarza kolizje dla wszystkich cząsteczek, uwzględniając warunki periodyczne.
+    
+    Dla każdej cząsteczki:
+      1. Obliczamy minimalny wektor przesunięcia między starą pozycją a nową (uwzględniając periodyczność),
+         czyli „odwijamy” ruch agenta.
+      2. Dla każdego obiektu przeszkody „odwijamy” także jego pozycję względem pozycji startowej agenta.
+      3. Sprawdzamy przecięcia trajektorii agenta z przeszkodami i korygujemy ruch oraz kierunek.
+      4. Na końcu „zapakowujemy” (modulo L) wynikową pozycję.
     """
-    x, y = pos
-    for cx, cy, R in obstacles:
-        dx = x - cx
-        dy = y - cy
-        if dx*dx + dy*dy < R*R:
-            return True
-    return False
+    N = positions.shape[0]
+    M = obstacles.shape[0]
+    for i in range(N):
+        # Obliczamy minimalny wektor przesunięcia (minimal image)
+        dx = positions[i,0] - old_positions[i,0]
+        dy = positions[i,1] - old_positions[i,1]
+        if dx > L/2:
+            dx -= L
+        elif dx < -L/2:
+            dx += L
+        if dy > L/2:
+            dy -= L
+        elif dy < -L/2:
+            dy += L
+        x_old = old_positions[i].copy()  # Pozycja startowa
+        x_new = np.empty(2)
+        x_new[0] = x_old[0] + dx
+        x_new[1] = x_old[1] + dy
+
+        dir_old = new_dirs[i]
+        min_t = 2.0
+        best_obs_index = -1
+        best_pt = np.zeros(2)
+        
+        # Szukamy najwcześniejszego przecięcia trajektorii agenta z przeszkodą
+        for j in range(M):
+            # "Odwijamy" środek przeszkody względem pozycji x_old
+            cx = obstacles[j, 0]
+            cy = obstacles[j, 1]
+            dx_obs = cx - x_old[0]
+            dy_obs = cy - x_old[1]
+            if dx_obs > L/2:
+                dx_obs -= L
+            elif dx_obs < -L/2:
+                dx_obs += L
+            if dy_obs > L/2:
+                dy_obs -= L
+            elif dy_obs < -L/2:
+                dy_obs += L
+            cx_eff = x_old[0] + dx_obs
+            cy_eff = x_old[1] + dy_obs
+            
+            R = obstacles[j, 2]
+            t_hit, p_hit = line_circle_intersect_numba(x_old, x_new, cx_eff, cy_eff, R)
+            if t_hit >= 0.0 and t_hit < min_t:
+                min_t = t_hit
+                best_obs_index = j
+                best_pt = p_hit.copy()
+                
+        if min_t <= 1.0 and best_obs_index != -1:
+            # Blok A: kolizja na torze ruchu
+            # Ustalamy środek przeszkody dla best_obs_index (również "odwinięty")
+            cx = obstacles[best_obs_index, 0]
+            cy = obstacles[best_obs_index, 1]
+            dx_obs = cx - x_old[0]
+            dy_obs = cy - x_old[1]
+            if dx_obs > L/2:
+                dx_obs -= L
+            elif dx_obs < -L/2:
+                dx_obs += L
+            if dy_obs > L/2:
+                dy_obs -= L
+            elif dy_obs < -L/2:
+                dy_obs += L
+            cx_eff = x_old[0] + dx_obs
+            cy_eff = x_old[1] + dy_obs
+            
+            R = obstacles[best_obs_index, 2]
+            nx = best_pt[0] - cx_eff
+            ny = best_pt[1] - cy_eff
+            norm = math.sqrt(nx*nx + ny*ny)
+            if norm < 1e-14:
+                norm = 1.0
+            unx = nx / norm
+            uny = ny / norm
+            # Odbicie – wyznaczamy nowy kąt
+            new_angle = reflect_direction_numba(dir_old, unx, uny)
+            # Weryfikacja: jeżeli nowy kąt nie kieruje wystarczająco na zewnątrz, wymuszamy kierunek wychodzący
+            vx = math.cos(new_angle)
+            vy = math.sin(new_angle)
+            if vx*unx + vy*uny < 0.1:
+                new_angle = math.atan2(uny, unx)
+            new_dirs[i] = new_angle
+            # Przesuwamy agenta poza przeszkodę
+            x_new[0] = best_pt[0] + eps * unx
+            x_new[1] = best_pt[1] + eps * uny
+        else:
+            # Blok B: nie wykryto przecięcia – sprawdzamy, czy końcowa pozycja (x_new) nie znajduje się wewnątrz przeszkody
+            for j in range(M):
+                cx = obstacles[j, 0]
+                cy = obstacles[j, 1]
+                dx_obs = cx - x_old[0]
+                dy_obs = cy - x_old[1]
+                if dx_obs > L/2:
+                    dx_obs -= L
+                elif dx_obs < -L/2:
+                    dx_obs += L
+                if dy_obs > L/2:
+                    dy_obs -= L
+                elif dy_obs < -L/2:
+                    dy_obs += L
+                cx_eff = x_old[0] + dx_obs
+                cy_eff = x_old[1] + dy_obs
+                
+                R = obstacles[j, 2]
+                dxc = x_new[0] - cx_eff
+                dyc = x_new[1] - cy_eff
+                dist = math.sqrt(dxc*dxc + dyc*dyc)
+                if dist < R:
+                    if dist < 1e-14:
+                        unx = 1.0
+                        uny = 0.0
+                    else:
+                        unx = dxc / dist
+                        uny = dyc / dist
+                    x_new[0] = cx_eff + (R + eps) * unx
+                    x_new[1] = cy_eff + (R + eps) * uny
+                    new_dirs[i] = math.atan2(uny, unx)
+                    break
+        # Dodatkowy pass – upewniamy się, że agent nie znajduje się wewnątrz żadnej przeszkody
+        for j in range(M):
+            cx = obstacles[j, 0]
+            cy = obstacles[j, 1]
+            dx_obs = cx - x_old[0]
+            dy_obs = cy - x_old[1]
+            if dx_obs > L/2:
+                dx_obs -= L
+            elif dx_obs < -L/2:
+                dx_obs += L
+            if dy_obs > L/2:
+                dy_obs -= L
+            elif dy_obs < -L/2:
+                dy_obs += L
+            cx_eff = x_old[0] + dx_obs
+            cy_eff = x_old[1] + dy_obs
+            
+            R = obstacles[j, 2]
+            dxc = x_new[0] - cx_eff
+            dyc = x_new[1] - cy_eff
+            dist = math.sqrt(dxc*dxc + dyc*dyc)
+            if dist < R:
+                if dist < 1e-14:
+                    unx = 1.0
+                    uny = 0.0
+                else:
+                    unx = dxc / dist
+                    uny = dyc / dist
+                x_new[0] = cx_eff + (R + eps) * unx
+                x_new[1] = cy_eff + (R + eps) * uny
+                new_dirs[i] = math.atan2(uny, unx)
+                break
+        
+        # "Pakujemy" wynikową pozycję do przedziału [0, L)
+        positions[i, 0] = x_new[0] % L
+        positions[i, 1] = x_new[1] % L
+
+#############################################
+# Reszta symulacji (główna pętla)
+#############################################
 
 def vicsek_simulation_with_obstacle_reflect(
     N=300, L=10.0, r=1.0, eta=0.2, v=0.03,
@@ -109,128 +242,67 @@ def vicsek_simulation_with_obstacle_reflect(
     store_trajectories=True
 ):
     """
-    Modyfikacja modelu Vicseka:
-     - cKDTree do sąsiadów,
-     - Okolice przeszkód: jeśli tor od x_old do x_new przecina okrąg,
-       to cząstka kończy ruch w punkcie przecięcia i odbija kierunek
-       względem normalnej do okręgu.
-     - Jeśli tor nie przecina, ale finał wypadł "wewnątrz" (skrajne),
-       to stawiamy na brzegu w najbliższym punkcie i odbijamy.
+    Model Vicseka z precyzyjnym odbiciem od przeszkód.
+      - Szukanie sąsiadów przy użyciu cKDTree.
+      - Obliczanie średniej orientacji + szum.
+      - Aktualizacja pozycji z warunkami brzegowymi.
+      - Sprawdzanie kolizji z przeszkodami – krytyczny fragment optymalizowany przez Numba.
     """
+    eps = 1e-2
+
     if obstacles is None:
-        obstacles = []
+        obstacles = np.empty((0, 3), dtype=np.float64)
+    else:
+        obstacles = np.array(obstacles, dtype=np.float64)
     
     positions = np.random.uniform(0, L, (N, 2))
     directions = np.random.uniform(0, 2*np.pi, (N,))
     
     if store_trajectories:
-        all_positions = np.zeros((steps+1, N, 2))
-        all_directions = np.zeros((steps+1, N))
-        all_positions[0] = positions
-        all_directions[0] = directions
+        all_positions = np.empty((steps+1, N, 2), dtype=np.float32)
+        all_directions = np.empty((steps+1, N), dtype=np.float32)
+        all_positions[0] = positions.copy()
+        all_directions[0] = directions.copy()
     else:
         all_positions, all_directions = None, None
     
     for step in range(steps):
-        # 1) cKDTree
+        # 1) Znalezienie sąsiadów (używamy cKDTree)
         tree = cKDTree(positions, boxsize=L)
-        neighbors_list = tree.query_ball_point(positions, r, n_jobs=-1)
-        
-        # Self-inclusion (Vicsek standard)
+        neighbors_list = tree.query_ball_point(positions, r)
         for i, nbrs in enumerate(neighbors_list):
             if i not in nbrs:
                 nbrs.append(i)
         
-        # 2) Średnie kąty + szum
+        # 2) Obliczamy średnią orientację + dodajemy szum
         sin_dir = np.sin(directions)
         cos_dir = np.cos(directions)
-        new_dirs = np.zeros_like(directions)
-        
+        new_dirs = np.empty_like(directions)
         for i, nbrs in enumerate(neighbors_list):
-            sum_sin = np.sum(sin_dir[nbrs])
-            sum_cos = np.sum(cos_dir[nbrs])
-            ccount = len(nbrs)
-            avg_sin = sum_sin / ccount
-            avg_cos = sum_cos / ccount
-            
-            noise = eta*(np.random.random()-0.5)  # [-eta/2, +eta/2]
+            avg_sin = np.mean(sin_dir[nbrs])
+            avg_cos = np.mean(cos_dir[nbrs])
+            noise = eta * (np.random.random() - 0.5)
             angle = np.arctan2(avg_sin, avg_cos) + noise
             new_dirs[i] = angle % (2*np.pi)
         
-        # 3) Aktualizujemy pozycje kandydujące
+        # 3) Aktualizacja pozycji – najpierw zwykły ruch, potem warunki brzegowe
         old_positions = positions.copy()
-        positions[:,0] += v*np.cos(new_dirs)*dt
-        positions[:,1] += v*np.sin(new_dirs)*dt
-        # Periodyczne brzegowe
-        positions %= L
+        positions[:, 0] += v * np.cos(new_dirs) * dt
+        positions[:, 1] += v * np.sin(new_dirs) * dt
+        positions %= L  # warunki brzegowe
         
-        # 4) Sprawdzamy kolizje z przeszkodami 
-        #    (szukamy najmniejszego t, jesli kilka okręgów)
-        for i in range(N):
-            x_old = old_positions[i]
-            x_new = positions[i]
-            dir_old = new_dirs[i]
-            
-            # Krok A: sprawdzamy wszystkie przeszkody, 
-            #         czy jest przecięcie w [0,1]?
-            min_t = 2.0
-            best_pt = None
-            best_obs = None
-            for (cx, cy, R) in obstacles:
-                t_hit, p_hit = line_circle_intersect(x_old, x_new, cx, cy, R)
-                if t_hit is not None and t_hit<min_t:
-                    min_t = t_hit
-                    best_pt = p_hit
-                    best_obs = (cx, cy, R)
-            
-            # Jeśli min_t <=1 => mamy kolizję "w trakcie" ruchu
-            if min_t <=1.0 and best_pt is not None:
-                # Wstawiamy w punkt kolizji
-                positions[i] = best_pt
-                # Odbijamy kierunek
-                cx, cy, R = best_obs
-                nx = best_pt[0] - cx
-                ny = best_pt[1] - cy
-                new_dirs[i] = reflect_direction(dir_old, (nx, ny))
-                
-            else:
-                # Krok B: sprawdź, czy finał nie jest jednak w środku
-                if inside_any_obstacle(positions[i], obstacles):
-                    # Wtedy stawiamy na brzegu w najbliższym punkcie 
-                    # i odbijamy w stronę normalną
-                    # (co oznacza, że wniknęliśmy - 
-                    #  to nieco bardziej "agresywne" wniknięcie, 
-                    #  więc może się rzadko zdarzać)
-                    # 
-                    # Znajdujemy obstacle, do którego wpadł 
-                    # (tu upraszczamy, że jest tylko jeden).
-                    for (cx, cy, R) in obstacles:
-                        dx = positions[i,0]-cx
-                        dy = positions[i,1]-cy
-                        dist = np.hypot(dx,dy)
-                        if dist < R:
-                            # stawiamy na brzegu 
-                            ratio = R/dist
-                            bx = cx + dx*ratio
-                            by = cy + dy*ratio
-                            positions[i,0]=bx
-                            positions[i,1]=by
-                            # normalna 
-                            new_dirs[i] = reflect_direction(
-                                new_dirs[i], (dx,dy)
-                            )
-                            break
+        # 4) Sprawdzamy kolizje – przekazujemy także L do funkcji, aby uwzględnić periodyczność
+        process_collisions(positions, old_positions, new_dirs, obstacles, eps, L)
         
-        # 5) Zatwierdzamy kierunki
-        directions = new_dirs
+        # 5) Uaktualniamy kierunki
+        directions = new_dirs.copy()
         
-        # 6) Zapis
-        if store_trajectories:
-            all_positions[step+1] = positions
-            all_directions[step+1] = directions
+        # 6) Zapisujemy trajektorie, jeśli wymagane
+        # if store_trajectories:
+            # all_positions[step+1] = positions.copy()
+        all_directions[step+1] = directions.copy()
     
     return all_positions, all_directions
-
 
 def measure_order_parameter_vectorized(all_directions):
     # Obliczanie cos(i kierunku) i sin(i kierunku) dla wszystkich cząstek i kroków czasowych
